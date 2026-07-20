@@ -1,0 +1,24 @@
+# NOTE (portable copy): paths use %h (your home dir). This unit assumes the repo
+# is checked out at %h/.openclaw/workspace/stackchan and daemon scripts at
+# %h/.openclaw/workspace/scripts/. Edit paths below to match YOUR install,
+# then: cp stackchan-agent-watch.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#       systemctl --user enable --now stackchan-agent-watch.service
+
+[Unit]
+Description=StackChan agent-status display (OpenClaw session activity -> LEDs/face)
+Documentation=file://%h/.openclaw/workspace/stackchan/README.md
+After=stackchan-gateway.service network-online.target
+Wants=stackchan-gateway.service
+PartOf=stackchan-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/workspace
+ExecStart=%h/.local/share/uv/tools/stackchan-mcp/bin/python %h/.openclaw/workspace/scripts/stackchan_agent_watch.py run
+Restart=on-failure
+RestartSec=15s
+StandardOutput=append:%h/.openclaw/workspace/stackchan/agent_status/watcher.log
+StandardError=append:%h/.openclaw/workspace/stackchan/agent_status/watcher.log
+
+[Install]
+WantedBy=default.target

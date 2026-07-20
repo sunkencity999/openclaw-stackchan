@@ -1,0 +1,24 @@
+# NOTE (portable copy): paths use %h (your home dir). This unit assumes the repo
+# is checked out at %h/.openclaw/workspace/stackchan and daemon scripts at
+# %h/.openclaw/workspace/scripts/. Edit paths below to match YOUR install,
+# then: cp stackchan-gateway.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#       systemctl --user enable --now stackchan-gateway.service
+
+[Unit]
+Description=StackChan MCP gateway (body wire for Cherubesque)
+Documentation=https://github.com/kisaragi-mochi/stackchan-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.openclaw/workspace/stackchan/gateway/.env
+WorkingDirectory=%h/.openclaw/workspace/stackchan/gateway
+ExecStart=%h/.local/bin/stackchan-mcp serve --transport streamable-http
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:%h/.openclaw/workspace/stackchan/logs/gateway.log
+StandardError=append:%h/.openclaw/workspace/stackchan/logs/gateway.err.log
+
+[Install]
+WantedBy=default.target

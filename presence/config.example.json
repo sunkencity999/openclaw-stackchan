@@ -1,0 +1,90 @@
+{
+  "_comment": "StackChan presence watcher config. Hot-reloaded on file mtime change.",
+
+  "frame_diff": {
+    "enabled": true,
+    "interval_seconds": 5,
+    "thumb_size": 32,
+    "threshold_mean_abs_delta": 28.0,
+    "_notes": "Threshold raised from 14 -> 28 on 2026-06-13 evening after idle-motion-induced ghost greetings. The camera is mounted on the head, and stackchan-idle-motion.service does slow sway + pitch-breath + occasional twitch, which shift the camera POV between captures and look like 14-18 delta room motion. 28 should skip past idle-induced deltas; a real human walking in will generate much higher delta. Proper fix is coordination (idle-motion publishes 'I just moved' timestamps, frame-diff skips post-move settle window)."
+  },
+
+  "mic_vad": {
+    "enabled": false,
+    "interval_seconds": 20,
+    "listen_seconds": 4,
+    "min_words": 2,
+    "hallucination_denylist": ["thank you", "thanks for watching", "thanks", "you", ".", "bye", "whoop", "hmm", "uh", "oh", "ok", "okay", "yeah", "bye-bye", "thank you for watching", "please subscribe"],
+    "_notes": "DISABLED 2026-06-13 16:46: faster-whisper hallucinates *full sentences* on ambient room audio (TV, music, other voices) that pass the denylist and fire fake presence events. Re-enable only when we add a real VAD layer or two-consecutive-poll confirmation. Frame_diff + BLE are doing the work fine without it."
+  },
+
+  "ble": {
+    "enabled": true,
+    "scan_interval_seconds": 6,
+    "rssi_present_threshold_dbm": -75,
+    "allowlist": [
+      {"name": "Christopher's phone", "mac": "REPLACE_WITH_MAC", "rssi_present_threshold_dbm": -75}
+    ],
+    "_notes": "Add MACs once observed via 'presence_watcher.py --scan'. RSSI >= threshold means 'in the room'. Higher (less negative) = closer."
+  },
+
+  "wifi": {
+    "enabled": true,
+    "poll_interval_seconds": 20,
+    "miss_tolerance": 6,
+    "devices": [
+      {"name": "Owner phone", "ip": "REPLACE_WITH_IP", "mac": "REPLACE_WITH_MAC", "identity": "Christopher"}
+    ],
+    "_notes": "Added 2026-07-15 (night build). Identity signal, not occupancy: phone on LAN = person is HOME; camera says IN OFFICE; fusion enriches anonymous motion with the name. MAC is the per-SSID persistent randomized MAC on bradfordsecnet; if Christopher resets network settings or the SSID changes, re-discover with ARP sweep. miss_tolerance 6 x 20s = 2min grace for phone deep-sleep ping drops."
+  },
+
+  "fusion": {
+    "mode": "occupancy_edge",
+    "absence_seconds_before_reset": 300,
+    "greeting_cooldown_seconds": 900,
+    "confirmed_presence_requires": "any",
+    "_notes": "occupancy_edge: track ABSENT/PRESENT state; only greet on the leading edge of ABSENT->PRESENT. Once PRESENT, repeated signals just refresh occupancy. State drops back to ABSENT after `absence_seconds_before_reset` of no signal (default 5 min). `greeting_cooldown_seconds` is a hard floor between greetings even if you walked in/out fast (default 15 min). 'confirmed_presence_requires': 'any'=single signal, 'two_of_three'=two signal types within 30s before declaring presence."
+  },
+
+  "on_presence": {
+    "log_jsonl": true,
+    "send_telegram": true,
+    "telegram_chat_id": "6902857843",
+    "telegram_template": "👀 Presence detected in the office ({signal}). Identity check: {identity}",
+    "_notes": "Telegram notify is the silent witness; the body greeting below is the actual show."
+  },
+
+  "body_greeting": {
+    "enabled": true,
+    "tts_engine": "elevenlabs",
+    "opening_face": "surprised",
+    "opening_face_hold_seconds": 0.5,
+    "face": "happy",
+    "blink_enabled": true,
+    "led_pulse": {
+      "r": 255, "g": 140, "b": 40,
+      "fade_in_ms": 400,
+      "hold_seconds": 1.8,
+      "fade_out_ms": 700,
+      "steps": 14
+    },
+    "nod": {
+      "enabled": true,
+      "path": [
+        {"pitch": 9, "hold_ms": 80},
+        {"pitch": 21, "hold_ms": 140},
+        {"pitch": 11, "hold_ms": 80},
+        {"pitch": 7, "hold_ms": 0}
+      ]
+    },
+    "speech_by_identity": {
+      "Christopher": "Hello, Christopher. Welcome back.",
+      "Christopher's phone": "Hello, Christopher. Welcome back.",
+      "Christopher's Quest 3": "Hello, Christopher. Welcome back.",
+      "unknown": "Oh — hello there."
+    },
+    "default_speech": "Hello there.",
+    "return_to_idle_after_seconds": 8,
+    "_notes": "Choreography: blink on → LED fade-in + opening_face (surprised, 0.5s) → main face (happy) + say → soft 4-point nod → LED fade-out → idle. Hot-reloads on config save. To mute, set enabled=false."
+  }
+}

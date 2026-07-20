@@ -1,0 +1,74 @@
+{
+  "_comment": "StackChan agent-status display config. Hot-reloaded on mtime change. Maps OpenClaw session activity to body cues (LEDs/face/nod). NO speech ever.",
+
+  "poll": {
+    "interval_seconds": 12,
+    "sessions_cmd": ["openclaw", "sessions", "list", "--json", "--all-agents", "--active", "10", "--limit", "all"],
+    "cmd_timeout_seconds": 20,
+    "running_age_ms": 30000,
+    "done_quiet_ms": 45000,
+    "error_window_ms": 120000,
+    "ignore_key_patterns": [],
+    "transcripts_glob": "/home/sunkencity999/.openclaw/agents/*/sessions/*.jsonl",
+    "exclude_agents": ["companion"],
+    "_notes": "RUNNING is detected from transcript file mtimes (appended live mid-turn), because sessions-list updatedAt only refreshes at turn boundaries. The CLI roster supplies session keys + abortedLastRun for the ERROR cue. A previously-running session quiet for done_quiet_ms (with nothing else running) fires DONE. exclude_agents keeps Esmeralda's (companion) private store untouched."
+  },
+
+  "cues": {
+    "idle": {
+      "enabled": true,
+      "face": "idle",
+      "led": {"r": 0, "g": 2, "b": 4},
+      "_notes": "Very dim teal so 'status display alive' is distinguishable from LEDs hard-off. Set 0/0/0 to go dark."
+    },
+    "running": {
+      "enabled": true,
+      "face": "thinking",
+      "led_low": {"r": 0, "g": 10, "b": 40},
+      "led_high": {"r": 0, "g": 40, "b": 140},
+      "pulse_step_seconds": 2.5,
+      "_notes": "Slow blue breath: alternates low/high every pulse_step_seconds while any session is active. One LED call per step; keep >=2s to avoid spamming the body."
+    },
+    "done": {
+      "enabled": true,
+      "face": "happy",
+      "led": {"r": 0, "g": 120, "b": 20},
+      "hold_seconds": 5,
+      "nod_enabled": true,
+      "nod_cooldown_seconds": 300,
+      "event_cooldown_seconds": 60,
+      "_notes": "Brief green + happy + (rate-limited) small nod on running->quiet edge, then back to idle. event_cooldown stops back-to-back cron sessions from strobing green."
+    },
+    "error": {
+      "enabled": true,
+      "led": {"r": 160, "g": 0, "b": 0},
+      "flashes": 3,
+      "on_seconds": 0.4,
+      "off_seconds": 0.3,
+      "cooldown_seconds": 300
+    },
+    "waiting": {
+      "enabled": true,
+      "face": "surprised",
+      "led": {"r": 150, "g": 70, "b": 0},
+      "flag_path": "/home/sunkencity999/.openclaw/workspace/stackchan/agent_status/waiting.flag",
+      "stale_seconds": 900,
+      "_notes": "OpenClaw has no CLI to query pending approvals, so waiting-on-user is a touch-file hook: `touch waiting.flag` when an agent needs input, remove it when answered. Flags older than stale_seconds are ignored and deleted."
+    },
+    "ack": {
+      "enabled": true,
+      "cues": ["done", "waiting"],
+      "poll_interval_seconds": 2,
+      "timeout_seconds": 60,
+      "log_path": "/home/sunkencity999/.openclaw/workspace/stackchan/agent_status/ack.log",
+      "_notes": "Tap-to-acknowledge: after a done/waiting cue fires, get_touch_state is polled every poll_interval_seconds for up to timeout_seconds (max ~30 polls per cue — NEVER at idle; see the 2026-07-16 reflex-daemon postmortem). A head tap/stroke clears the cue to idle immediately, appends a JSON line to log_path, and (for waiting) removes waiting.flag. NOTE: with ack enabled the done cue holds green up to timeout_seconds instead of hold_seconds; disable here to restore the old 5s hold. poll_interval_seconds has a hard floor of 2s in code."
+    }
+  },
+
+  "coordination": {
+    "presence_state_path": "/home/sunkencity999/.openclaw/workspace/stackchan/presence/state.json",
+    "defer_after_greeting_seconds": 45,
+    "gateway_backoff_seconds": 60,
+    "_notes": "Presence watcher wins: after it fires a greeting (last_greeting_iso), this daemon sends no cues for defer_after_greeting_seconds. On gateway/body errors, cue sends pause for gateway_backoff_seconds (state machine keeps running)."
+  }
+}

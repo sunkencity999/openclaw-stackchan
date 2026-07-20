@@ -1,0 +1,36 @@
+# --- Secrets / credentials (NEVER commit) ---
+token.secret
+*.secret
+.env
+.env.*
+credentials/
+*api_key*
+
+# --- Runtime state, logs, flags ---
+*.log
+*.log.*
+logs/
+state.json
+*.jsonl
+waiting.flag
+ack.log
+
+# --- Presence watcher: live config holds personal MACs/IPs; state is private ---
+presence/config.json
+presence/state.json
+presence/logs/
+
+# --- Conversation loop: live config embeds personal OpenClaw session keys ---
+convo/
+
+# --- Media & large binaries (get firmware from upstream releases) ---
+photos/
+voice_samples/
+avatars/
+firmware/
+
+# --- Python / Node ---
+__pycache__/
+*.pyc
+.venv/
+node_modules/
