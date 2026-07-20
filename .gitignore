@@ -34,3 +34,7 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+
+# --- Voice loop: live config embeds a personal OpenClaw session key ---
+voice_loop/config.json
+voice_loop/voice.log

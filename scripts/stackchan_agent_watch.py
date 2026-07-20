@@ -489,16 +489,35 @@ class Watcher:
         if now < self.ack["next_poll"]:
             return
         a = self._ack_cfg()
+        debug = bool(a.get("touch_debug", False))
         self.ack["next_poll"] = now + max(2.0, float(a.get("poll_interval_seconds", 2)))
         st = await self.body.touch_state()
         if not st or not st.get("available"):
+            if debug:
+                log("DEBUG ack touch poll: no/unavailable state", cue=self.ack["cue"],
+                    raw_response=st)
             return
         elapsed = time.monotonic() - self.ack["start"]
         age_s = float(st.get("last_event_age_ms", 1e15)) / 1000.0
-        touched = (
-            bool(st.get("zone0") or st.get("zone1") or st.get("zone2"))
-            or (st.get("last_event") in ("tap", "stroke") and age_s < elapsed)
+        # Absolute (monotonic) time the last touch event fired. Compare against
+        # the window start minus a grace period: play_done sends face/LED/nod
+        # BEFORE opening the window (~1.5-2s), so a tap right when the green
+        # cue appears lands slightly before ack.start. The old strict
+        # `age_s < elapsed` check could NEVER catch those taps (the age stayed
+        # permanently ahead of elapsed) — 2026-07-19 field-failure root cause.
+        grace = float(a.get("grace_seconds", 5.0))
+        event_mono = time.monotonic() - age_s
+        fresh_event = (
+            st.get("last_event") in ("tap", "stroke")
+            and event_mono >= self.ack["start"] - grace
         )
+        zones = bool(st.get("zone0") or st.get("zone1") or st.get("zone2"))
+        touched = zones or fresh_event
+        if debug:
+            log("DEBUG ack touch poll", cue=self.ack["cue"], raw_response=st,
+                elapsed_s=round(elapsed, 1), age_s=round(age_s, 1),
+                grace_s=grace, zones=zones, fresh_event=fresh_event,
+                touched=touched)
         if not touched:
             return
         cue = self.ack["cue"]

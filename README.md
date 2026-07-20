@@ -49,6 +49,28 @@ never at idle. A tap/stroke clears the cue back to idle immediately and appends 
 line to `agent_status/ack.log`. Untouched cues auto-clear on timeout. Tunables live in
 `agent_status/config.json` under `cues.ack`.
 
+Detection details (2026-07-19 field fix): a tap fired right as the green cue appears
+lands *before* the ack window opens (the done cue plays face/LED/nod first), so the
+watcher accepts tap/stroke events up to `cues.ack.grace_seconds` (default 5) before
+window start. Short taps typically register as firmware `stroke` events (~400–1900ms);
+the instantaneous `zone0..2` booleans rarely catch them at a 2s poll cadence.
+Set `cues.ack.touch_debug: true` to log every raw touch response + threshold decision
+to `watcher.log` during ack windows.
+
+### Tap-to-talk voice loop (scaffold — disabled by default)
+
+`scripts/stackchan_voice_loop.py` + `systemd/stackchan-voice-loop.service` (NOT enabled):
+long-press the head (zones held ≥1.5s, or a fresh firmware `stroke`) while the
+agent-status watcher reports `idle` → chime (`say`) + steady cyan LEDs → gateway
+`listen` (~6s, faster-whisper local STT) → transcription routed to the owner's main
+OpenClaw session via `openclaw sessions send` as `[voice] <text> [[speak]]` (the
+`[[speak]]` marker signals the reply should also go to body TTS). Safety defaults:
+`route.send_enabled: false` (dry-run logs the exact command), touch polling gated to
+agent-status `idle` only (never competes with ack windows; see the touch-poll budget
+warning in the script docstring). Config: copy `voice_loop/config.example.json` →
+`voice_loop/config.json` (live config is gitignored — embeds a personal session key).
+Enable after review: `systemctl --user enable --now stackchan-voice-loop.service`.
+
 ### Repo layout
 
 - `scripts/` — portable copies of the two watcher daemons

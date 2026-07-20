@@ -60,8 +60,10 @@
       "cues": ["done", "waiting"],
       "poll_interval_seconds": 2,
       "timeout_seconds": 60,
+      "grace_seconds": 5,
+      "touch_debug": true,
       "log_path": "/home/sunkencity999/.openclaw/workspace/stackchan/agent_status/ack.log",
-      "_notes": "Tap-to-acknowledge: after a done/waiting cue fires, get_touch_state is polled every poll_interval_seconds for up to timeout_seconds (max ~30 polls per cue — NEVER at idle; see the 2026-07-16 reflex-daemon postmortem). A head tap/stroke clears the cue to idle immediately, appends a JSON line to log_path, and (for waiting) removes waiting.flag. NOTE: with ack enabled the done cue holds green up to timeout_seconds instead of hold_seconds; disable here to restore the old 5s hold. poll_interval_seconds has a hard floor of 2s in code."
+      "_notes": "Tap-to-acknowledge: after a done/waiting cue fires, get_touch_state is polled every poll_interval_seconds for up to timeout_seconds (max ~30 polls per cue — NEVER at idle; see the 2026-07-16 reflex-daemon postmortem). A head tap/stroke clears the cue to idle immediately, appends a JSON line to log_path, and (for waiting) removes waiting.flag. NOTE: with ack enabled the done cue holds green up to timeout_seconds instead of hold_seconds; disable here to restore the old 5s hold. poll_interval_seconds has a hard floor of 2s in code. grace_seconds: taps up to this long BEFORE the window opened still count (the done cue plays face/LED/nod ~2s before the window opens — 2026-07-19 fix). touch_debug: logs every raw touch response + threshold decision to watcher.log during ack windows; set false to quiet."
     }
   },
 

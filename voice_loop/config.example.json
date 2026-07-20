@@ -1,0 +1,49 @@
+{
+  "_comment": "StackChan tap-to-talk voice loop. Hot-reloaded on mtime change. send_enabled=false keeps sessions-send in dry-run (logged, not sent).",
+  "enabled": true,
+  "poll_interval_seconds": 0.5,
+  "idle_gate_seconds": 3.0,
+  "long_press_seconds": 1.5,
+  "stroke_trigger": true,
+  "stroke_fresh_ms": 1500,
+  "listen_duration_ms": 6000,
+  "listen_engine": "faster-whisper",
+  "cooldown_seconds": 15,
+  "chime": {
+    "enabled": true,
+    "text": "Yes?"
+  },
+  "cues": {
+    "listening_led": {
+      "r": 0,
+      "g": 120,
+      "b": 120
+    },
+    "listening_face": "thinking",
+    "ok_led": {
+      "r": 0,
+      "g": 120,
+      "b": 20
+    },
+    "fail_led": {
+      "r": 120,
+      "g": 40,
+      "b": 0
+    },
+    "idle_led": {
+      "r": 0,
+      "g": 2,
+      "b": 4
+    },
+    "idle_face": "idle"
+  },
+  "route": {
+    "send_enabled": false,
+    "session_key": "agent:main:telegram:direct:YOUR_TELEGRAM_ID",
+    "prefix": "[voice] ",
+    "speak_marker": " [[speak]]",
+    "openclaw_bin": "openclaw",
+    "cmd_timeout_seconds": 30
+  },
+  "min_transcript_chars": 2
+}
