@@ -59,7 +59,7 @@
       "enabled": true,
       "cues": ["done", "waiting"],
       "poll_interval_seconds": 2,
-      "timeout_seconds": 60,
+      "timeout_seconds": 12,
       "grace_seconds": 5,
       "touch_debug": false,
       "ack_surface": "head",
