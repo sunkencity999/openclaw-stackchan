@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-# PORTABLE COPY for the stackchan repo. For a new install, edit the hardcoded
-# WORKSPACE / path constants below (they point at /home/sunkencity999/... on
-# the original box) or export the STACKCHAN_* env overrides where supported.
-# Canonical live copy on the origin machine: ~/.openclaw/workspace/scripts/
 """StackChan presence watcher.
 
 Three independent presence signals run concurrently:
@@ -654,6 +650,17 @@ class Fusion:
     async def _on_presence(self, signal: str, identity: str) -> None:
         # Fire the body greeting in the background so it doesn't stall
         # the watcher loop (TTS + nod can take several seconds).
+        # STANDDOWN: if the agent-status watcher has an ack window open,
+        # skip the greeting so we don't overwrite its green/amber hold cue.
+        # The user is interacting with the body for a different reason.
+        try:
+            from pathlib import Path as _P
+            _ack_flag = _P.home() / ".openclaw" / "workspace" / "stackchan" / "agent_status" / "ack_window.flag"
+            if _ack_flag.exists():
+                log("greeting suppressed: agent-status ack window is open")
+                return
+        except Exception:
+            pass
         greet_cfg = self.cfg_ref["cfg"].section("body_greeting")
         if greet_cfg.get("enabled", True):
             asyncio.create_task(

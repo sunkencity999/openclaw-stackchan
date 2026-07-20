@@ -61,8 +61,15 @@
       "poll_interval_seconds": 2,
       "timeout_seconds": 60,
       "grace_seconds": 5,
-      "touch_debug": true,
+      "touch_debug": false,
       "ack_surface": "head",
+      "voice_ack": {
+        "enabled": true,
+        "listen_seconds": 4,
+        "keywords": ["acknowledge", "acknowledged", "got it", "clear it", "dismiss", "stand down", "okay cherub", "thanks cherub", "i see it", "noted"],
+        "ignore": ["you", "oh", "thank you", "bye", "the", ".", ""],
+        "_notes": "Voice-ack is the PRIMARY dismiss path (2026-07-19): say a keyword during a green/amber cue to clear it. Works across a fan-noisy office where the tiny Si12T head pads are unreliable. Keyword-gated (substring match) so whisper ambient-noise hallucinations do not false-ack; ignore lists known noise hallucinations to explicitly drop. When enabled, each ack poll does a ~listen_seconds mic capture INSTEAD of a touch poll (never both, to bound gateway load). Set enabled false to revert to touch-only. Tune keywords to taste; avoid bare okay/yes/thanks (too easily hallucinated from fans)."
+      },
       "_ack_surface_notes": "head (Si12T) is the only working ack surface as of 2026-07-19. screen/both are reserved for future once LCD-touch has an MCP verb — stackchan-mcp 0.10.0 does NOT expose one; LCD taps are swallowed by firmware ToggleChatState (start/stop listen). See README LCD-touch gap section.",
       "log_path": "/home/sunkencity999/.openclaw/workspace/stackchan/agent_status/ack.log",
       "_notes": "Tap-to-acknowledge: after a done/waiting cue fires, get_touch_state is polled every poll_interval_seconds for up to timeout_seconds (max ~30 polls per cue — NEVER at idle; see the 2026-07-16 reflex-daemon postmortem). A head tap/stroke clears the cue to idle immediately, appends a JSON line to log_path, and (for waiting) removes waiting.flag. NOTE: with ack enabled the done cue holds green up to timeout_seconds instead of hold_seconds; disable here to restore the old 5s hold. poll_interval_seconds has a hard floor of 2s in code. grace_seconds: taps up to this long BEFORE the window opened still count (the done cue plays face/LED/nod ~2s before the window opens — 2026-07-19 fix). touch_debug: logs every raw touch response + threshold decision to watcher.log during ack windows; set false to quiet."

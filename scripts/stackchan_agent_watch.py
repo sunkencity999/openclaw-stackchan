@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-# PORTABLE COPY for the stackchan repo. For a new install, edit the hardcoded
-# WORKSPACE / path constants below (they point at /home/sunkencity999/... on
-# the original box) or export the STACKCHAN_* env overrides where supported.
-# Canonical live copy on the origin machine: ~/.openclaw/workspace/scripts/
 """StackChan agent-status display daemon.
 
 Turns the StackChan body into a live status indicator for OpenClaw agent
@@ -68,6 +64,7 @@ from typing import Any
 
 WORKSPACE = Path("/home/sunkencity999/.openclaw/workspace")
 STATUS_DIR = WORKSPACE / "stackchan" / "agent_status"
+ACK_HOLD_FLAG = STATUS_DIR / "ack_window.flag"  # presence-watcher standdown signal
 CONFIG_PATH = STATUS_DIR / "config.json"
 STATE_PATH = STATUS_DIR / "state.json"
 
@@ -244,6 +241,34 @@ class Body:
             backoff = float(self.cfg.sec("coordination").get("gateway_backoff_seconds", 60))
             self.backoff_until = now + backoff
             log("touch poll failed; backing off", error=str(exc)[:200], backoff_s=backoff)
+            return None
+
+    async def listen(self, seconds: float) -> str | None:
+        """Capture a short utterance via the gateway `listen` verb (faster-
+        whisper STT, local). Returns the lowercased transcription text, or
+        None on failure. Blocks for ~seconds while capturing.
+        """
+        now = time.monotonic()
+        if now < self.backoff_until:
+            return None
+        try:
+            res = await asyncio.wait_for(
+                mcp_call("listen", {"seconds": float(seconds)}),
+                timeout=float(seconds) + 15,
+            )
+            if isinstance(res, dict):
+                return str(res.get("text", "")).strip().lower() or None
+            if isinstance(res, str):
+                # Some builds return the JSON as a bare string.
+                with contextlib.suppress(ValueError, TypeError):
+                    d = json.loads(res)
+                    return str(d.get("text", "")).strip().lower() or None
+                return res.strip().lower() or None
+            return None
+        except Exception as exc:
+            backoff = float(self.cfg.sec("coordination").get("gateway_backoff_seconds", 60))
+            self.backoff_until = now + backoff
+            log("listen failed; backing off", error=str(exc)[:200], backoff_s=backoff)
             return None
 
 
@@ -447,6 +472,14 @@ class Watcher:
             "deadline": now + float(a.get("timeout_seconds", 60)),
             "next_poll": now + poll,
         }
+        # Drop the standdown flag so presence-watcher won't overwrite our cue
+        # with a greeting during the window. Cleared on ack, timeout, or cancel.
+        with contextlib.suppress(OSError):
+            ACK_HOLD_FLAG.write_text(json.dumps({
+                "cue": cue,
+                "opened_iso": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "deadline_mono": self.ack["deadline"],
+            }))
         log("ack window opened", cue=cue,
             timeout_s=float(a.get("timeout_seconds", 60)), poll_s=poll)
 
@@ -454,14 +487,17 @@ class Watcher:
         if self.ack:
             log("ack window cancelled", cue=self.ack["cue"], reason=reason)
             self.ack = None
+            with contextlib.suppress(OSError):
+                ACK_HOLD_FLAG.unlink(missing_ok=True)
 
-    def _ack_log(self, cue: str) -> None:
+    def _ack_log(self, cue: str, method: str = "touch") -> None:
         a = self._ack_cfg()
         path = Path(a.get("log_path", str(STATUS_DIR / "ack.log")))
         line = json.dumps({
             "ts_iso": datetime.now().astimezone().isoformat(timespec="seconds"),
             "event": "ack",
             "cue": cue,
+            "method": method,
         }, ensure_ascii=False)
         with contextlib.suppress(OSError):
             with path.open("a") as fh:
@@ -480,6 +516,8 @@ class Watcher:
         if now >= self.ack["deadline"]:
             cue = self.ack["cue"]
             self.ack = None
+            with contextlib.suppress(OSError):
+                ACK_HOLD_FLAG.unlink(missing_ok=True)
             log("ack window timed out; auto-clearing", cue=cue)
             if cue == "done":
                 await self.enter_idle()
@@ -489,6 +527,46 @@ class Watcher:
         if now < self.ack["next_poll"]:
             return
         a = self._ack_cfg()
+        # Re-assert the ack cue color EVERY tick so any competing LED writer
+        # (presence watcher, gateway keepalive, stray cue) can't wipe green.
+        cue_name = self.ack["cue"]
+        cue_cfg = self.cfg.sec("cues", cue_name)
+        cue_led = cue_cfg.get("led")
+        if cue_led:
+            await self.body.leds(cue_led, force=True)
+
+        # --- Voice-ack (primary path 2026-07-19) --------------------------
+        # Say a keyword (e.g. "acknowledge", "got it", "clear it") to dismiss
+        # the cue. More reliable than the tiny Si12T pads and works from
+        # across a fan-noisy office. Keyword-gated (not open-mic) to keep
+        # whisper's ambient-noise hallucinations from false-acking.
+        v = a.get("voice_ack", {})
+        if v.get("enabled", False):
+            self.ack["next_poll"] = now + max(
+                2.0, float(a.get("poll_interval_seconds", 2))
+            )
+            secs = float(v.get("listen_seconds", 4))
+            heard = await self.body.listen(secs)
+            keywords = [str(k).lower() for k in v.get(
+                "keywords",
+                ["acknowledge", "acknowledged", "got it", "clear it",
+                 "dismiss", "stand down", "okay cherub", "thanks cherub"],
+            )]
+            ignore = [str(k).lower() for k in v.get(
+                "ignore", ["you", "oh", "thank you", "bye", ".", ""])]
+            if debug := bool(a.get("touch_debug", False)):
+                log("DEBUG voice-ack poll", cue=self.ack["cue"], heard=heard,
+                    keywords=keywords)
+            if heard and heard not in ignore:
+                matched = next((k for k in keywords if k in heard), None)
+                if matched:
+                    await self._clear_ack(
+                        method="voice", detail={"heard": heard, "matched": matched}
+                    )
+                    return
+            # Voice mode does NOT also poll touch (avoids double gateway load
+            # per tick). Touch fallback below only runs when voice disabled.
+            return
         # ack_surface: which touch surface(s) count as an ack.
         #   "head"   — head Si12T only (default, only working option 2026-07-19)
         #   "screen" — LCD FT6336 (STUB: no MCP verb exists; requires an audio
@@ -529,11 +607,21 @@ class Watcher:
                 touched=touched)
         if not touched:
             return
+        await self._clear_ack(
+            method="touch",
+            detail={"last_event": st.get("last_event"), "age_s": round(age_s, 1)},
+        )
+
+    async def _clear_ack(self, method: str, detail: dict[str, Any] | None = None) -> None:
+        """Common cue-acknowledged teardown for any ack method (touch/voice)."""
+        if not self.ack:
+            return
         cue = self.ack["cue"]
         self.ack = None
-        log("cue acknowledged by touch", cue=cue,
-            last_event=st.get("last_event"), age_s=round(age_s, 1))
-        self._ack_log(cue)
+        with contextlib.suppress(OSError):
+            ACK_HOLD_FLAG.unlink(missing_ok=True)
+        log("cue acknowledged", cue=cue, method=method, **(detail or {}))
+        self._ack_log(cue, method=method)
         if cue == "waiting":
             w = self.cfg.sec("cues", "waiting")
             flag = Path(w.get("flag_path", str(STATUS_DIR / "waiting.flag")))
@@ -554,7 +642,14 @@ class Watcher:
         self.last_done = now
         log("done event: green pulse")
         await self.body.face(c.get("face", "happy"))
-        await self.body.leds(c.get("led", {"r": 0, "g": 120, "b": 20}), force=True)
+        green = c.get("led", {"r": 0, "g": 200, "b": 30})
+        # Attention-grabbing flash pattern before settling into hold — makes
+        # the cue impossible to miss even at a glance. Then hold.
+        for _ in range(int(c.get("attention_flashes", 2))):
+            await self.body.leds({"r": 0, "g": 0, "b": 0}, force=True)
+            await asyncio.sleep(0.15)
+            await self.body.leds(green, force=True)
+            await asyncio.sleep(0.25)
         if c.get("nod_enabled", True) and (
             now - self.last_nod >= float(c.get("nod_cooldown_seconds", 300))
         ):
