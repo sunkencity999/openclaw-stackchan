@@ -489,6 +489,15 @@ class Watcher:
         if now < self.ack["next_poll"]:
             return
         a = self._ack_cfg()
+        # ack_surface: which touch surface(s) count as an ack.
+        #   "head"   — head Si12T only (default, only working option 2026-07-19)
+        #   "screen" — LCD FT6336 (STUB: no MCP verb exists; requires an audio
+        #              hook + firmware ToggleChatState detour — see LCD-touch
+        #              gap doc in stackchan/README.md). Falls back to "head".
+        #   "both"   — currently identical to "head" until screen path lands.
+        surface = str(a.get("ack_surface", "head")).lower()
+        if surface not in ("head", "screen", "both"):
+            surface = "head"
         debug = bool(a.get("touch_debug", False))
         self.ack["next_poll"] = now + max(2.0, float(a.get("poll_interval_seconds", 2)))
         st = await self.body.touch_state()

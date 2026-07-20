@@ -57,6 +57,36 @@ the instantaneous `zone0..2` booleans rarely catch them at a 2s poll cadence.
 Set `cues.ack.touch_debug: true` to log every raw touch response + threshold decision
 to `watcher.log` during ack windows.
 
+#### ⚠ LCD-touch (FT6336) gap — 2026-07-19
+
+The LCD is the more intuitive ack surface (bigger, easier to hit than the tiny Si12T
+head pads), but **stackchan-mcp 0.10.0 exposes NO screen-touch verb**. Full firmware
+tool inventory: 19 forwarded verbs across `self.audio_speaker`, `self.camera`,
+`self.display` (avatar/blink/mouth only), `self.led`, `self.robot`,
+`self.screen.set_brightness` (that's the only `screen` verb), `self.touch.get_touch_state`
+(head Si12T only) — plus `listen`, `say`, `load_avatar_set`, and a few diag verbs. No
+`screen_touch`, `get_screen_touch`, `touch_point`, or FT6336-related endpoint.
+
+**What LCD taps actually do (built-in firmware behavior, not our daemon):** the
+xiaozhi-esp32 firmware routes LCD taps to `Application::ToggleChatState`, same handler
+as the wake word / physical button. First tap enters listening mode (green base-LED
+chat-state indicator ON), second tap exits it (green OFF). That is what Christopher
+was seeing — it is completely independent of the agent-status daemon's DONE green cue,
+and there is no gateway-side signal we can poll for it. The device does emit a
+`{"type":"listen","state":"start|stop"}` WebSocket notification, but the gateway only
+forwards it when `STACKCHAN_AUDIO_HOOK_URL` is configured (it isn't). ⚠ Collision risk:
+firmware and daemon both drive base LEDs, so LCD-toggled green can visually clash with
+our DONE green pulse — treat them as separate signals.
+
+**Config knob (present, but only one option works):**
+`cues.ack.ack_surface` in `agent_status/config.json`, defaults to `"head"`.
+`"screen"` and `"both"` are reserved and currently fall back to `"head"`. To make
+screen-ack real would require either patching stackchan-mcp gateway to expose
+`get_screen_touch` (firmware would still need a matching handler), or wiring an
+audio-hook receiver at `STACKCHAN_AUDIO_HOOK_URL` and treating device-driven
+`listen.start` as an ack signal (with the side effect that every LCD tap also enters
+firmware listening mode).
+
 ### Tap-to-talk voice loop (scaffold — disabled by default)
 
 `scripts/stackchan_voice_loop.py` + `systemd/stackchan-voice-loop.service` (NOT enabled):
