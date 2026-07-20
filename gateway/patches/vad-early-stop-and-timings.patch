@@ -1,0 +1,165 @@
+--- /home/sunkencity999/.local/share/uv/tools/stackchan-mcp/lib/python3.12/site-packages/stackchan_mcp/stt/orchestrator.py.bak.vad-20260719	2026-07-19 23:17:33.817439671 -0700
++++ /home/sunkencity999/.local/share/uv/tools/stackchan-mcp/lib/python3.12/site-packages/stackchan_mcp/stt/orchestrator.py	2026-07-19 23:18:30.499341208 -0700
+@@ -70,6 +70,103 @@
+ #: transition; 50 ms is well above typical scheduling latency.
+ LISTEN_START_TRANSITION_DELAY_S = 0.05
+ 
++# local-patch: vad-early-stop (2026-07-19). Optional energy-based VAD so a
++# listen() capture can end as soon as the speaker stops talking instead of
++# always burning the full duration_ms window. Enabled per-call via the
++# ``vad_early_stop`` argument (the voice-loop daemon passes it for prompt
++# captures). Tunables (all overridable per-call):
++#   vad_speech_rms      RMS threshold above which a 60 ms frame counts as
++#                       speech (16-bit scale; room noise ~100-300, speech
++#                       near the body typically >800). Default 500.
++#   vad_silence_ms      trailing silence after detected speech that ends
++#                       the capture. Default 700.
++#   vad_min_speech_ms   minimum accumulated speech before trailing silence
++#                       can end the capture (guards against a single pop).
++#                       Default 240.
++#   vad_onset_grace_ms  if NO speech has been detected by this point the
++#                       capture ends early (nobody is talking). Default
++#                       3000.
++VAD_POLL_S = 0.12
++VAD_DEFAULTS = {
++    "vad_speech_rms": 500,
++    "vad_silence_ms": 700,
++    "vad_min_speech_ms": 240,
++    "vad_onset_grace_ms": 3000,
++}
++
++
++def _frame_rms(frame: bytes) -> int:
++    """RMS of one Opus frame, decoded independently (fine for energy)."""
++    try:
++        import audioop  # deprecated in 3.13 but present on 3.12
++
++        pcm = decode_opus_frames([frame])
++        if not pcm:
++            return 0
++        return audioop.rms(pcm, 2)
++    except Exception:
++        return 0
++
++
++async def _vad_capture_wait(duration_ms: int, params: dict[str, Any]) -> bool:
++    """Poll the recording buffer, return True if we stopped early.
++
++    Reads the module-level frame buffer in :mod:`..audio_stream` (safe:
++    single asyncio loop, we only ever read the list the device handler
++    appends to).
++    """
++    from .. import audio_stream as _as
++
++    speech_rms = int(params.get("vad_speech_rms", VAD_DEFAULTS["vad_speech_rms"]))
++    silence_ms = int(params.get("vad_silence_ms", VAD_DEFAULTS["vad_silence_ms"]))
++    min_speech_ms = int(
++        params.get("vad_min_speech_ms", VAD_DEFAULTS["vad_min_speech_ms"])
++    )
++    onset_grace_ms = int(
++        params.get("vad_onset_grace_ms", VAD_DEFAULTS["vad_onset_grace_ms"])
++    )
++
++    start = asyncio.get_running_loop().time()
++    seen = 0
++    speech_ms = 0
++    trailing_silence_ms = 0
++    speech_started = False
++
++    while True:
++        now = asyncio.get_running_loop().time()
++        elapsed_ms = (now - start) * 1000.0
++        if elapsed_ms >= duration_ms:
++            return False
++
++        frames = _as._recording_frames  # noqa: SLF001 (same-process read)
++        new = frames[seen:]
++        seen = len(frames)
++        for fr in new:
++            if _frame_rms(fr) >= speech_rms:
++                speech_started = True
++                speech_ms += DEVICE_FRAME_DURATION_MS
++                trailing_silence_ms = 0
++            elif speech_started:
++                trailing_silence_ms += DEVICE_FRAME_DURATION_MS
++
++        if speech_started:
++            if speech_ms >= min_speech_ms and trailing_silence_ms >= silence_ms:
++                logger.info(
++                    "listen(): VAD early stop after %.0f ms "
++                    "(speech=%d ms, trailing silence=%d ms)",
++                    elapsed_ms, speech_ms, trailing_silence_ms,
++                )
++                return True
++        elif elapsed_ms >= onset_grace_ms:
++            logger.info(
++                "listen(): VAD early stop after %.0f ms (no speech onset)",
++                elapsed_ms,
++            )
++            return True
++
++        await asyncio.sleep(VAD_POLL_S)
++
++
+ LISTENING_FACE = "thinking"
+ IDLE_FACE = "idle"
+ LISTEN_MOTIONS = {"none", "face-only", "look-up"}
+@@ -387,6 +484,10 @@
+     actual_duration_ms = 0
+     motion_saved_angles: tuple[float, float] | None = None
+     succeeded = False
++    # local-patch: vad-early-stop + stage timings
++    vad_stopped_early = False
++    capture_wall_ms = 0
++    transcribe_ms = 0
+ 
+     async with lock_ctx:
+         connection = gateway.esp32.connection
+@@ -434,7 +535,17 @@
+                 # ``TTS_START_TRANSITION_DELAY_S``).
+                 await asyncio.sleep(LISTEN_START_TRANSITION_DELAY_S)
+ 
+-                await asyncio.sleep(duration_ms / 1000.0)
++                # local-patch: vad-early-stop
++                _t_cap0 = asyncio.get_running_loop().time()
++                if arguments.get("vad_early_stop"):
++                    vad_stopped_early = await _vad_capture_wait(
++                        duration_ms, arguments
++                    )
++                else:
++                    await asyncio.sleep(duration_ms / 1000.0)
++                capture_wall_ms = int(
++                    (asyncio.get_running_loop().time() - _t_cap0) * 1000
++                )
+             finally:
+                 # Cancellation-safe listen.stop. If the request is
+                 # cancelled mid-capture (or any exception unwinds here)
+@@ -491,6 +602,7 @@
+             actual_duration_ms = frame_count * DEVICE_FRAME_DURATION_MS
+ 
+             if pcm:
++                _t_tr0 = asyncio.get_running_loop().time()
+                 try:
+                     result = await engine.transcribe(
+                         pcm,
+@@ -503,6 +615,9 @@
+                     raise RuntimeError(
+                         f"STT engine '{engine_name}' failed: {exc}"
+                     ) from exc
++                transcribe_ms = int(
++                    (asyncio.get_running_loop().time() - _t_tr0) * 1000
++                )
+             else:
+                 # Empty capture — return an empty transcription rather
+                 # than failing the call. ``language`` falls back to the
+@@ -565,4 +680,10 @@
+         "duration_ms": actual_duration_ms,
+         "frame_count": frame_count,
+         "sample_rate": DEVICE_SAMPLE_RATE,
++        # local-patch: vad-early-stop + stage timings
++        "vad_stopped_early": vad_stopped_early,
++        "timings": {
++            "capture_ms": capture_wall_ms,
++            "transcribe_ms": transcribe_ms,
++        },
+     }

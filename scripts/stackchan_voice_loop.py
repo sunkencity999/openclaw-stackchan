@@ -357,6 +357,7 @@ class VoiceLoop:
         # rate accounting
         self.calls = 0
         self.rate_window_start = time.monotonic()
+        self.last_listen_timing: dict[str, Any] = {}
 
     # -- mic ownership flag ---------------------------------------------------
 
@@ -384,20 +385,42 @@ class VoiceLoop:
             self.calls = 0
             self.rate_window_start = now
 
-    async def listen(self, seconds: float, why: str) -> str | None:
+    async def listen(self, seconds: float, why: str,
+                     vad: bool = False) -> str | None:
         """One gateway listen window; returns transcript ('' ok) or None on
-        gateway failure (backoff armed)."""
+        gateway failure (backoff armed). vad=True asks the gateway to end
+        the capture on end-of-speech (local-patch: vad-early-stop)."""
         now = time.monotonic()
         if now < self.backoff_until:
             return None
         self._flag_up(why)
+        t0 = time.monotonic()
         try:
             self._count_call()
-            res = await mcp_call("listen", {
+            args: dict[str, Any] = {
                 "duration_ms": int(seconds * 1000),
                 "language": str(self.cfg.get("language", default="en")),
                 "model": str(self.cfg.get("stt_model", default="base.en")),
-            }, timeout=seconds + 25)
+            }
+            if vad:
+                args["vad_early_stop"] = True
+                for k in ("vad_speech_rms", "vad_silence_ms",
+                          "vad_min_speech_ms", "vad_onset_grace_ms"):
+                    v = self.cfg.get(k)
+                    if v is not None:
+                        args[k] = v
+            res = await mcp_call("listen", args, timeout=seconds + 25)
+            rtt_ms = int((time.monotonic() - t0) * 1000)
+            gw_t = res.get("timings", {}) if isinstance(res, dict) else {}
+            self.last_listen_timing = {
+                "why": why, "rtt_ms": rtt_ms,
+                "capture_ms": gw_t.get("capture_ms"),
+                "transcribe_ms": gw_t.get("transcribe_ms"),
+                "vad_stopped_early": (res.get("vad_stopped_early")
+                                      if isinstance(res, dict) else None),
+            }
+            if why == "prompt":
+                log("stage timing: prompt listen", **self.last_listen_timing)
             return extract_listen_text(res)
         except Exception as exc:
             backoff = float(self.cfg.get("gateway_backoff_seconds", default=60))
@@ -433,6 +456,7 @@ class VoiceLoop:
     # -- wake -> prompt -> route ---------------------------------------------
 
     async def handle_wake(self, remainder: str, wake_heard: str) -> None:
+        t_wake = time.monotonic()
         cue_cfg = self.cfg.get("listening_cue", default={})
         log("wake word detected", heard=wake_heard, remainder=remainder)
         await self.cue(cue_cfg.get("led"), cue_cfg.get("face"))
@@ -448,7 +472,8 @@ class VoiceLoop:
                 await self.say(str(cue_cfg.get("greeting", "Yes?")))
             heard = await self.listen(
                 float(self.cfg.get("prompt_listen_seconds", default=7.0)),
-                why="prompt")
+                why="prompt",
+                vad=bool(self.cfg.get("vad_early_stop", default=True)))
             log("prompt window transcription", heard=heard)
             if heard and is_real_prompt(self.cfg, heard):
                 prompt = heard.strip()
@@ -462,7 +487,37 @@ class VoiceLoop:
             self.cooldown_until = time.monotonic() + 3.0
             return
 
-        ok = self.route(prompt)
+        t_prompt_done = time.monotonic()
+
+        # Instant "thinking" ack: cue + short verbal ack fired as a
+        # background task so it overlaps the agent turn instead of
+        # delaying it. The turn itself runs in a thread (subprocess) so
+        # the ack audio can stream while the agent thinks.
+        think_led = self.cfg.get("thinking_led",
+                                 default={"r": 60, "g": 0, "b": 90})
+        await self.cue(think_led, "thinking")
+        ack_task = None
+        ack_text = str(self.cfg.get("thinking_ack", default="On it."))
+        if ack_text:
+            ack_task = asyncio.create_task(self.say(ack_text))
+
+        t_route0 = time.monotonic()
+        ok = await asyncio.to_thread(self.route, prompt)
+        t_route_ms = int((time.monotonic() - t_route0) * 1000)
+        if ack_task:
+            with contextlib.suppress(Exception):
+                await ack_task
+
+        lt = self.last_listen_timing
+        log("stage timing: interaction",
+            wake_to_prompt_ms=int((t_prompt_done - t_wake) * 1000),
+            prompt_capture_ms=lt.get("capture_ms"),
+            prompt_transcribe_ms=lt.get("transcribe_ms"),
+            vad_stopped_early=lt.get("vad_stopped_early"),
+            agent_turn_ms=t_route_ms,
+            total_ms=int((time.monotonic() - t_wake) * 1000),
+            ok=ok)
+
         await self.cue(
             self.cfg.get("ok_led" if ok else "fail_led", default={}), None)
         await asyncio.sleep(1.0)

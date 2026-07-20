@@ -1,0 +1,84 @@
+--- /home/sunkencity999/.local/share/uv/tools/stackchan-mcp/lib/python3.12/site-packages/stackchan_mcp/stt/faster_whisper.py.bak.gpu-20260719	2026-07-19 23:21:17.862909672 -0700
++++ /home/sunkencity999/.local/share/uv/tools/stackchan-mcp/lib/python3.12/site-packages/stackchan_mcp/stt/faster_whisper.py	2026-07-19 23:21:46.407923870 -0700
+@@ -142,12 +142,34 @@
+             # Model init is blocking; off-load to a thread so the
+             # asyncio loop keeps pumping (gateway also handles ESP32
+             # frames concurrently while we're loading on first use).
+-            self._model = await asyncio.to_thread(
+-                WhisperModel,
+-                self._model_name,
+-                device=self._device,
+-                compute_type=self._compute_type,
+-            )
++            # local-patch: gpu-fallback (2026-07-19). If the requested
++            # device is cuda and init fails (GPU full / driver hiccup /
++            # unsupported compute type), fall back to cpu+int8 instead of
++            # leaving the STT engine dead. The mic must never die because
++            # the Blackwell is busy.
++            try:
++                self._model = await asyncio.to_thread(
++                    WhisperModel,
++                    self._model_name,
++                    device=self._device,
++                    compute_type=self._compute_type,
++                )
++            except Exception as exc:
++                if self._device == "cpu":
++                    raise
++                logger.warning(
++                    "faster-whisper init on device=%s failed (%s); "
++                    "falling back to cpu/int8",
++                    self._device, str(exc)[:200],
++                )
++                self._device = "cpu"
++                self._compute_type = "int8"
++                self._model = await asyncio.to_thread(
++                    WhisperModel,
++                    self._model_name,
++                    device="cpu",
++                    compute_type="int8",
++                )
+             return self._model
+ 
+     async def transcribe(self, pcm: bytes, **opts: Any) -> dict[str, Any]:
+@@ -215,7 +237,39 @@
+                 "language_probability": float(info.language_probability),
+             }
+ 
+-        result = await asyncio.to_thread(_run)
++        # local-patch: gpu-fallback — runtime CUDA failure (OOM mid-run
++        # etc.) reinits on cpu/int8 and retries once instead of failing
++        # the listen() call.
++        try:
++            result = await asyncio.to_thread(_run)
++        except Exception as exc:
++            if self._device == "cpu":
++                raise
++            logger.warning(
++                "faster-whisper transcribe on device=%s failed (%s); "
++                "reinit on cpu/int8 and retrying",
++                self._device, str(exc)[:200],
++            )
++            self._device = "cpu"
++            self._compute_type = "int8"
++            self._model = None
++            model = await self._load_model()
++
++            def _run_cpu() -> dict[str, Any]:
++                segments, info = model.transcribe(
++                    audio_f32,
++                    language=language,
++                    beam_size=1,
++                    vad_filter=False,
++                )
++                text = "".join(seg.text for seg in segments).strip()
++                return {
++                    "text": text,
++                    "language": info.language or (language or ""),
++                    "language_probability": float(info.language_probability),
++                }
++
++            result = await asyncio.to_thread(_run_cpu)
+         logger.info(
+             "faster-whisper transcribed pcm_bytes=%d language=%s text=%r",
+             len(pcm),
