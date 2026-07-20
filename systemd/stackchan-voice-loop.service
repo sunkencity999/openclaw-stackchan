@@ -1,25 +1,23 @@
-# NOTE (portable copy): paths use %h (your home dir). This unit assumes the repo
-# is checked out at %h/.openclaw/workspace/stackchan and daemon scripts at
-# %h/.openclaw/workspace/scripts/. Edit paths below to match YOUR install,
-# then: cp stackchan-voice-loop.service ~/.config/systemd/user/ && systemctl --user daemon-reload
-# ⚠ SCAFFOLD: review scripts/stackchan_voice_loop.py (touch-poll budget +
-# route.send_enabled) BEFORE: systemctl --user enable --now stackchan-voice-loop.service
-
 [Unit]
-Description=StackChan tap-to-talk voice loop (long-press -> listen -> route to main session) [SCAFFOLD - do not enable without approval]
-Documentation=file://%h/.openclaw/workspace/stackchan/README.md
+Description=StackChan wake-word voice loop (say "Hey Cherub" -> prompt routes to OpenClaw main session)
+Documentation=file:///home/sunkencity999/.openclaw/workspace/stackchan/README.md
 After=stackchan-gateway.service network-online.target
 Wants=stackchan-gateway.service
 PartOf=stackchan-gateway.service
+# Mutually exclusive with the phase-B convo loop: both poll the same mic.
+Conflicts=stackchan-convo.service
+OnFailure=unit-failure-alert@%N.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.openclaw/workspace
-ExecStart=%h/.local/share/uv/tools/stackchan-mcp/bin/python %h/.openclaw/workspace/scripts/stackchan_voice_loop.py run
+WorkingDirectory=/home/sunkencity999/.openclaw/workspace
+ExecStart=/home/sunkencity999/.local/share/uv/tools/stackchan-mcp/bin/python /home/sunkencity999/.openclaw/workspace/scripts/stackchan_voice_loop.py run
 Restart=on-failure
 RestartSec=15s
-StandardOutput=append:%h/.openclaw/workspace/stackchan/voice_loop/voice.log
-StandardError=append:%h/.openclaw/workspace/stackchan/voice_loop/voice.log
+Nice=5
+CPUWeight=60
+StandardOutput=append:/home/sunkencity999/.openclaw/workspace/stackchan/voice_loop/voice.log
+StandardError=append:/home/sunkencity999/.openclaw/workspace/stackchan/voice_loop/voice.log
 
 [Install]
 WantedBy=default.target

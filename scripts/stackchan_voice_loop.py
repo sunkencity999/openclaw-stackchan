@@ -1,55 +1,75 @@
 #!/usr/bin/env python3
-# PORTABLE COPY for the stackchan repo. For a new install, edit the hardcoded
-# WORKSPACE / path constants below (they point at /home/sunkencity999/... on
-# the original box) or export the STACKCHAN_* env overrides where supported.
-# Canonical live copy on the origin machine: ~/.openclaw/workspace/scripts/
-"""StackChan tap-to-talk voice loop (PART B scaffold, 2026-07-19 — NOT ENABLED).
+"""StackChan wake-word voice loop — talk to Cherub, prompt routes to OpenClaw.
 
-Long-press the head while the agent-status watcher is IDLE → the body chimes,
-shows a steady cyan "listening" cue, captures ~6s of mic audio via the
-gateway's `listen` verb (faster-whisper STT, local), and routes the
-transcription into Christopher's main OpenClaw Telegram session as:
+LIVE as of 2026-07-19 (replaces the long-press scaffold). Say a wake word
+("hey cherub" / "cherub" / "okay cherub") toward the body while the
+agent-status watcher reports IDLE; the body cues (cyan LEDs, thinking face,
+Brian says "Yes?"), captures your prompt (~7 s), and routes the whisper
+transcription to Christopher's main OpenClaw Telegram session as:
 
     [voice] <transcription> [[speak]]
 
-The `[[speak]]` marker tells the responding agent the reply should also be
-piped to the body's TTS (ElevenLabs Brian) — a companion hook can watch for
-it, or the main agent can act on it directly.
+The trailing ``[[speak]]`` marker is the contract with the main agent: a
+message carrying it arrived via the body's microphone, so the reply should
+ALSO be spoken through the body — e.g. `scripts/stackchan.py say "<reply>"`
+(ElevenLabs Brian) — in addition to the normal Telegram text reply.
 
-Gesture disambiguation vs tap-to-ack (stackchan_agent_watch.py):
-  - SHORT tap during a done/waiting cue  → ack (agent-watch owns that; this
-    daemon never polls unless agent-status state == "idle").
-  - LONG press (zones held >= long_press_seconds across consecutive polls)
-    or a fresh firmware "stroke" event while idle → voice capture.
+VAD / wake-word approach (documented per the build task):
+  The gateway MCP ``listen`` verb performs the whole capture server-side
+  (device Opus frames -> faster-whisper) and returns TEXT ONLY — raw PCM
+  never leaves the gateway process (see stackchan/convo/DESIGN.md §1 Path A).
+  Client-side webrtcvad on raw frames is therefore impossible on this path.
+  Instead we run a bounded short-listen loop: one ~3 s listen window, then a
+  deliberate gap, repeated ONLY while the agent-status state machine says
+  "idle" and no ack window is open. Wake detection is a normalized-substring
+  + fuzzy n-gram match on the transcription (same proven matcher as
+  convo_loop.py — catches whisper manglings like "cherub" -> "sherub").
 
-⚠ TOUCH-POLL BUDGET WARNING (read before enabling):
-  The old reflex daemon was killed 2026-07-16 for continuous ~3 calls/sec
-  touch polling. This daemon polls get_touch_state at poll_interval_seconds
-  (default 0.5s = 2 calls/sec) but ONLY while agent_status/state.json says
-  "idle"; any other state (running / waiting / done-ack) drops to a slow
-  gate check (idle_gate_seconds, default 3s) with NO touch traffic.
-  If gateway load is a concern, raise poll_interval_seconds to 1.0.
+Gateway call budget (hard requirement: << reflex-daemon's ~3/s disaster,
+target <= 0.5/s):
+  Each wake cycle = 1 listen call taking ~window(3 s) + transcribe(~1 s),
+  followed by wake_poll_gap_seconds (default 1.0 s) of silence. Effective
+  sustained rate ~= 1 / 5 s = 0.2 calls/sec while idle; ZERO calls while any
+  agent is running/waiting or an ack window is open (slow 3 s file-stat gate
+  only). The loop logs its measured rate every ~5 min (`rate report`).
 
-Safety: the actual `openclaw sessions send` is gated behind config
-  "send_enabled": false  (default) — dry-run logs the exact command instead.
-Flip it after review.
+Coordination:
+  - Only captures when agent_status/state.json == "idle" AND
+    agent_status/ack_window.flag is absent (never competes with tap/voice-ack
+    windows or presence greetings).
+  - Writes voice_loop/capturing.flag while it holds the mic; the agent-status
+    watcher skips its voice-ack listens while that flag is fresh.
+  - MUTUALLY EXCLUSIVE with stackchan-convo.service (the phase-B convo loop):
+    both poll the same mic. Keep exactly one enabled. This daemon refuses to
+    capture if convo state.json reports a live non-stopped loop.
+
+Safety / degradation:
+  - Gateway/body failures -> 60 s backoff, never crash-loop.
+  - Empty / hallucinated ("thank you", "you", ...) / too-short transcripts
+    are discarded; a wake with no follow-up prompt aborts quietly.
+  - route: ``send_enabled`` in config flips real sends <-> dry-run logging.
+  - Cooldown after every capture (default 10 s) so one conversation doesn't
+    machine-gun the main session.
 
 Run with the gateway venv python (has mcp[client]):
   /home/sunkencity999/.local/share/uv/tools/stackchan-mcp/bin/python \
       scripts/stackchan_voice_loop.py run
-  ... once   # single status snapshot (gate state + touch read), no capture
+  ... once   # single gate snapshot + one wake window, no send
 
-Config: stackchan/voice_loop/config.json (hot-reloaded on mtime change;
-created with defaults on first run). Systemd unit exists but is NOT enabled:
-  systemctl --user enable --now stackchan-voice-loop.service   # when approved
+Config: stackchan/voice_loop/config.json (hot-reload on mtime; defaults
+written on first run). Service: stackchan-voice-loop.service.
+Disable:  systemctl --user disable --now stackchan-voice-loop.service
+Dry-run:  set "send_enabled": false in config.json (hot-reloads in-place).
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
+import difflib
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -63,7 +83,10 @@ WORKSPACE = Path("/home/sunkencity999/.openclaw/workspace")
 VOICE_DIR = WORKSPACE / "stackchan" / "voice_loop"
 CONFIG_PATH = VOICE_DIR / "config.json"
 LOG_PATH = VOICE_DIR / "voice.log"
+CAPTURING_FLAG = VOICE_DIR / "capturing.flag"
 AGENT_STATE_PATH = WORKSPACE / "stackchan" / "agent_status" / "state.json"
+ACK_FLAG_PATH = WORKSPACE / "stackchan" / "agent_status" / "ack_window.flag"
+CONVO_STATE_PATH = WORKSPACE / "stackchan" / "convo" / "state.json"
 
 GATEWAY_URL = os.environ.get("STACKCHAN_GATEWAY_URL", "http://127.0.0.1:8777/mcp")
 TOKEN_PATH = Path(
@@ -75,47 +98,61 @@ TOKEN_PATH = Path(
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "_comment": (
-        "StackChan tap-to-talk voice loop. Hot-reloaded on mtime change. "
-        "send_enabled=false keeps sessions-send in dry-run (logged, not sent)."
+        "StackChan wake-word voice loop. Hot-reloaded on mtime change. "
+        "send_enabled=false => dry-run (exact command logged, not sent)."
     ),
     "enabled": True,
-    "poll_interval_seconds": 0.5,
-    "idle_gate_seconds": 3.0,
-    "long_press_seconds": 1.5,
-    "stroke_trigger": True,
-    "stroke_fresh_ms": 1500,
-    "listen_duration_ms": 6000,
-    "listen_engine": "faster-whisper",
-    "cooldown_seconds": 15,
-    "chime": {"enabled": True, "text": "Yes?"},
-    "cues": {
-        "listening_led": {"r": 0, "g": 120, "b": 120},
-        "listening_face": "thinking",
-        "ok_led": {"r": 0, "g": 120, "b": 20},
-        "fail_led": {"r": 120, "g": 40, "b": 0},
-        "idle_led": {"r": 0, "g": 2, "b": 4},
-        "idle_face": "idle",
+    # Wake detection ---------------------------------------------------------
+    "wake_words": ["hey cherub", "okay cherub", "ok cherub", "hey cherubesque", "cherub"],
+    "fuzzy_ratio": 0.82,
+    "wake_listen_seconds": 3.0,
+    "wake_poll_gap_seconds": 1.0,
+    # Prompt capture ----------------------------------------------------------
+    "prompt_listen_seconds": 7.0,
+    "min_prompt_chars": 2,
+    "min_prompt_words": 1,
+    "ignore": [
+        "thank you", "thanks for watching", "thanks", "you", ".", "bye",
+        "whoop", "hmm", "uh", "oh", "ok", "okay", "yeah", "bye-bye",
+        "thank you for watching", "please subscribe", "silence", "music",
+    ],
+    # Gating ------------------------------------------------------------------
+    "idle_poll_seconds": 3.0,       # gate re-check cadence while NOT idle (no mic)
+    "cooldown_seconds": 10.0,
+    "stt_model": "base.en",
+    "language": "en",
+    # Routing -----------------------------------------------------------------
+    "send_enabled": True,
+    "target_session": "agent:main:telegram:direct:6902857843",
+    "prefix": "[voice] ",
+    "speak_marker": " [[speak]]",
+    "openclaw_bin": "openclaw",
+    "deliver_reply": True,
+    "cmd_timeout_seconds": 180,
+    # Cues --------------------------------------------------------------------
+    "listening_cue": {
+        "greeting": "Yes?",
+        "greeting_enabled": True,
+        "led": {"r": 0, "g": 120, "b": 120},
+        "face": "thinking",
     },
-    "route": {
-        "send_enabled": False,
-        "session_key": "agent:main:telegram:direct:6902857843",
-        "prefix": "[voice] ",
-        "speak_marker": " [[speak]]",
-        "openclaw_bin": "openclaw",
-        "cmd_timeout_seconds": 30,
-    },
-    "min_transcript_chars": 2,
+    "ok_led": {"r": 0, "g": 120, "b": 20},
+    "fail_led": {"r": 100, "g": 30, "b": 0},
+    "idle_led": {"r": 0, "g": 2, "b": 4},
+    "idle_face": "idle",
+    "gateway_backoff_seconds": 60,
 }
+
+_PUNCT_RE = re.compile(r"[^\w\s']", re.UNICODE)
 
 
 def log(msg: str, **kw: Any) -> None:
-    entry = {"ts": round(time.time(), 3), "msg": msg, **kw}
+    entry = {"ts": round(time.time(), 3),
+             "iso": datetime.now().astimezone().isoformat(timespec="seconds"),
+             "msg": msg, **kw}
     line = json.dumps(entry, ensure_ascii=False)
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
-    with contextlib.suppress(OSError):
-        with LOG_PATH.open("a") as fh:
-            fh.write(line + "\n")
 
 
 class Config:
@@ -139,7 +176,8 @@ class Config:
                 self.raw = merged
                 self.mtime = mtime
                 if not force:
-                    log("config reloaded")
+                    log("config reloaded",
+                        send_enabled=bool(merged.get("send_enabled")))
 
     def get(self, *names: str, default: Any = None) -> Any:
         node: Any = self.raw
@@ -149,6 +187,10 @@ class Config:
             node = node.get(n)
         return default if node is None else node
 
+
+# ---------------------------------------------------------------------------
+# Gateway MCP client (per-call session, same pattern as agent-watch)
+# ---------------------------------------------------------------------------
 
 def _load_token() -> str | None:
     tok = os.environ.get("STACKCHAN_TOKEN")
@@ -188,8 +230,87 @@ async def mcp_call(tool: str, args: dict[str, Any] | None = None,
     return await asyncio.wait_for(_inner(), timeout=timeout)
 
 
+def extract_listen_text(result: Any) -> str:
+    """Pull the transcription out of a listen() result (gateway returns the
+    JSON blob {engine, text, language, ...} either structured or as text)."""
+    def from_blob(v: str) -> str:
+        v = v.strip()
+        if not v:
+            return ""
+        try:
+            obj = json.loads(v)
+        except Exception:
+            return v
+        if isinstance(obj, dict):
+            inner = obj.get("text")
+            if isinstance(inner, str):
+                return inner.strip()
+        return ""
+
+    if isinstance(result, dict):
+        v = result.get("text")
+        return v.strip() if isinstance(v, str) else ""
+    if isinstance(result, str):
+        return from_blob(result)
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, str):
+                t = from_blob(item)
+                if t:
+                    return t
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                t = from_blob(item["text"])
+                if t:
+                    return t
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Text helpers (matcher proven in convo_loop.py)
+# ---------------------------------------------------------------------------
+
+def normalize(text: str) -> str:
+    return _PUNCT_RE.sub(" ", text.lower()).replace("  ", " ").strip()
+
+
+def wake_match(cfg: Config, transcript: str) -> tuple[bool, str]:
+    """Return (matched, remainder-after-wake-word)."""
+    norm = normalize(transcript)
+    if len(norm) < 3:
+        return False, ""
+    phrases = [normalize(p) for p in cfg.get("wake_words", default=[]) if p]
+    ratio = float(cfg.get("fuzzy_ratio", default=0.82))
+
+    for p in sorted(phrases, key=len, reverse=True):
+        idx = norm.find(p)
+        if idx >= 0:
+            return True, norm[idx + len(p):].strip()
+
+    words = norm.split()
+    for p in sorted(phrases, key=len, reverse=True):
+        p_len = max(1, len(p.split()))
+        for i in range(0, max(1, len(words) - p_len + 1)):
+            gram = " ".join(words[i:i + p_len])
+            if difflib.SequenceMatcher(None, p, gram).ratio() >= ratio:
+                return True, " ".join(words[i + p_len:]).strip()
+    return False, ""
+
+
+def is_real_prompt(cfg: Config, transcript: str) -> bool:
+    norm = normalize(transcript)
+    if len(norm) < int(cfg.get("min_prompt_chars", default=2)):
+        return False
+    deny = {normalize(d) for d in cfg.get("ignore", default=[])}
+    if norm in deny:
+        return False
+    return len(norm.split()) >= int(cfg.get("min_prompt_words", default=1))
+
+
+# ---------------------------------------------------------------------------
+# Gating
+# ---------------------------------------------------------------------------
+
 def agent_state() -> str:
-    """Read the agent-status watcher's derived state; unknown => not idle."""
     try:
         st = json.loads(AGENT_STATE_PATH.read_text())
         return str(st.get("state", "unknown"))
@@ -197,160 +318,240 @@ def agent_state() -> str:
         return "unknown"
 
 
+def convo_loop_live() -> bool:
+    """True if the phase-B convo loop appears to be actively running."""
+    try:
+        st = json.loads(CONVO_STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return False
+    if str(st.get("state", "stopped")) in ("stopped", "disabled"):
+        return False
+    pid = st.get("pid")
+    if not pid:
+        return False
+    return Path(f"/proc/{int(pid)}").exists()
+
+
+def gate_open(cfg: Config) -> tuple[bool, str]:
+    if not cfg.get("enabled", default=True):
+        return False, "disabled in config"
+    if agent_state() != "idle":
+        return False, f"agent state={agent_state()}"
+    if ACK_FLAG_PATH.exists():
+        return False, "ack window open"
+    if convo_loop_live():
+        return False, "convo loop live (mutually exclusive)"
+    return True, "idle"
+
+
+# ---------------------------------------------------------------------------
+# Voice loop
+# ---------------------------------------------------------------------------
+
 class VoiceLoop:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.stop = asyncio.Event()
-        self.held_since: float | None = None   # zones continuously true since
         self.backoff_until = 0.0
         self.cooldown_until = 0.0
+        # rate accounting
+        self.calls = 0
+        self.rate_window_start = time.monotonic()
 
-    # -- touch gating ---------------------------------------------------------
+    # -- mic ownership flag ---------------------------------------------------
 
-    async def touch(self) -> dict[str, Any] | None:
+    def _flag_up(self, why: str) -> None:
+        with contextlib.suppress(OSError):
+            CAPTURING_FLAG.write_text(json.dumps({
+                "pid": os.getpid(), "why": why,
+                "iso": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }))
+
+    def _flag_down(self) -> None:
+        with contextlib.suppress(OSError):
+            CAPTURING_FLAG.unlink(missing_ok=True)
+
+    # -- gateway helpers ------------------------------------------------------
+
+    def _count_call(self) -> None:
+        self.calls += 1
+        now = time.monotonic()
+        if now - self.rate_window_start >= 300:
+            rate = self.calls / (now - self.rate_window_start)
+            log("rate report", gateway_calls=self.calls,
+                window_s=round(now - self.rate_window_start),
+                calls_per_sec=round(rate, 3))
+            self.calls = 0
+            self.rate_window_start = now
+
+    async def listen(self, seconds: float, why: str) -> str | None:
+        """One gateway listen window; returns transcript ('' ok) or None on
+        gateway failure (backoff armed)."""
         now = time.monotonic()
         if now < self.backoff_until:
             return None
+        self._flag_up(why)
         try:
-            res = await mcp_call("get_touch_state", {}, timeout=10)
-            return res if isinstance(res, dict) else None
+            self._count_call()
+            res = await mcp_call("listen", {
+                "duration_ms": int(seconds * 1000),
+                "language": str(self.cfg.get("language", default="en")),
+                "model": str(self.cfg.get("stt_model", default="base.en")),
+            }, timeout=seconds + 25)
+            return extract_listen_text(res)
         except Exception as exc:
-            self.backoff_until = now + 60
-            log("touch poll failed; backing off 60s", error=str(exc)[:200])
+            backoff = float(self.cfg.get("gateway_backoff_seconds", default=60))
+            self.backoff_until = time.monotonic() + backoff
+            log("listen failed; backing off", why=why, error=str(exc)[:200],
+                backoff_s=backoff)
             return None
+        finally:
+            self._flag_down()
 
-    def long_press(self, st: dict[str, Any]) -> str | None:
-        """Return trigger reason if the long-press gesture fired."""
-        now = time.monotonic()
-        zones = bool(st.get("zone0") or st.get("zone1") or st.get("zone2"))
-        if zones:
-            if self.held_since is None:
-                self.held_since = now
-            elif now - self.held_since >= float(self.cfg.get("long_press_seconds", default=1.5)):
-                self.held_since = None
-                return "zones-held"
-        else:
-            self.held_since = None
-        if self.cfg.get("stroke_trigger", default=True):
-            age = float(st.get("last_event_age_ms", 1e15))
-            if st.get("last_event") == "stroke" and age <= float(
-                self.cfg.get("stroke_fresh_ms", default=1500)
-            ):
-                return "fresh-stroke"
-        return None
-
-    # -- capture + route ------------------------------------------------------
-
-    async def cue(self, led: dict[str, Any] | None, face: str | None) -> None:
+    async def cue(self, led: dict[str, Any] | None = None,
+                  face: str | None = None) -> None:
         with contextlib.suppress(Exception):
             if face:
-                await mcp_call("set_avatar", {"face": face})
+                self._count_call()
+                await mcp_call("set_avatar", {"face": face}, timeout=10)
+        with contextlib.suppress(Exception):
             if led:
+                self._count_call()
                 await mcp_call("set_all_leds", {
                     "r": int(led.get("r", 0)), "g": int(led.get("g", 0)),
                     "b": int(led.get("b", 0)),
-                })
+                }, timeout=10)
 
-    async def capture(self, reason: str) -> None:
-        cues = self.cfg.get("cues", default={})
-        log("long-press detected; starting capture", reason=reason)
-        await self.cue(cues.get("listening_led"), cues.get("listening_face"))
-        if self.cfg.get("chime", "enabled", default=True):
-            with contextlib.suppress(Exception):
-                await mcp_call("say", {"text": str(self.cfg.get("chime", "text", default="Yes?"))},
-                               timeout=20)
-        dur = int(self.cfg.get("listen_duration_ms", default=6000))
-        text = ""
-        try:
-            res = await mcp_call("listen", {
-                "duration_ms": dur,
-                "engine": str(self.cfg.get("listen_engine", default="faster-whisper")),
-            }, timeout=max(30.0, dur / 1000 + 20))
-            if isinstance(res, dict):
-                if res.get("error"):
-                    log("listen returned error", error=str(res["error"])[:200])
-                text = str(res.get("text") or res.get("transcription") or "").strip()
-            elif isinstance(res, str):
-                text = res.strip()
-        except Exception as exc:
-            log("listen failed", error=str(exc)[:200])
+    async def say(self, text: str) -> None:
+        if not text:
+            return
+        with contextlib.suppress(Exception):
+            self._count_call()
+            await mcp_call("say", {"text": text, "voice": "elevenlabs"},
+                           timeout=60)
 
-        if len(text) >= int(self.cfg.get("min_transcript_chars", default=2)):
-            ok = self.route(text)
-            await self.cue(cues.get("ok_led") if ok else cues.get("fail_led"), None)
+    # -- wake -> prompt -> route ---------------------------------------------
+
+    async def handle_wake(self, remainder: str, wake_heard: str) -> None:
+        cue_cfg = self.cfg.get("listening_cue", default={})
+        log("wake word detected", heard=wake_heard, remainder=remainder)
+        await self.cue(cue_cfg.get("led"), cue_cfg.get("face"))
+
+        prompt = ""
+        # Latency win: words spoken after the wake word in the same window
+        # already form the prompt ("hey cherub what time is it").
+        if remainder and is_real_prompt(self.cfg, remainder):
+            prompt = remainder
+            log("prompt taken from wake window", prompt=prompt)
         else:
-            log("empty/too-short transcription; discarded", text=text)
-            await self.cue(cues.get("fail_led"), None)
-        await asyncio.sleep(1.2)
-        await self.cue(cues.get("idle_led"), cues.get("idle_face"))
+            if cue_cfg.get("greeting_enabled", True):
+                await self.say(str(cue_cfg.get("greeting", "Yes?")))
+            heard = await self.listen(
+                float(self.cfg.get("prompt_listen_seconds", default=7.0)),
+                why="prompt")
+            log("prompt window transcription", heard=heard)
+            if heard and is_real_prompt(self.cfg, heard):
+                prompt = heard.strip()
+
+        if not prompt:
+            log("no usable prompt after wake; aborting quietly")
+            await self.cue(self.cfg.get("fail_led", default={}), None)
+            await asyncio.sleep(0.8)
+            await self.cue(self.cfg.get("idle_led", default={}),
+                           self.cfg.get("idle_face", default="idle"))
+            self.cooldown_until = time.monotonic() + 3.0
+            return
+
+        ok = self.route(prompt)
+        await self.cue(
+            self.cfg.get("ok_led" if ok else "fail_led", default={}), None)
+        await asyncio.sleep(1.0)
+        await self.cue(self.cfg.get("idle_led", default={}),
+                       self.cfg.get("idle_face", default="idle"))
         self.cooldown_until = time.monotonic() + float(
-            self.cfg.get("cooldown_seconds", default=15))
+            self.cfg.get("cooldown_seconds", default=10.0))
 
     def route(self, text: str) -> bool:
-        r = self.cfg.get("route", default={})
-        msg = f"{r.get('prefix', '[voice] ')}{text}{r.get('speak_marker', ' [[speak]]')}"
-        cmd = [str(r.get("openclaw_bin", "openclaw")), "sessions", "send",
-               str(r.get("session_key", "")), msg]
-        entry = {
-            "ts_iso": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "transcription": text,
-            "message": msg,
-        }
-        if not r.get("send_enabled", False):
-            log("DRY-RUN (route.send_enabled=false); would send",
-                cmd=shlex.join(cmd), **entry)
+        # NOTE: there is no `openclaw sessions send` CLI (checked 2026-07-19,
+        # OpenClaw 2026.6.10). The supported way to inject a user turn into a
+        # stored session is `openclaw agent --session-key ... --message ...`
+        # (same mechanism convo_loop.py uses). --deliver sends the agent's
+        # reply to the session's Telegram channel so Christopher sees it.
+        msg = (f"{self.cfg.get('prefix', default='[voice] ')}{text}"
+               f"{self.cfg.get('speak_marker', default=' [[speak]]')}")
+        cmd = [str(self.cfg.get("openclaw_bin", default="openclaw")),
+               "agent",
+               "--session-key", str(self.cfg.get("target_session", default="")),
+               "--message", msg, "--json"]
+        if self.cfg.get("deliver_reply", default=True):
+            cmd.append("--deliver")
+        if not self.cfg.get("send_enabled", default=True):
+            log("DRY-RUN (send_enabled=false); would send",
+                cmd=shlex.join(cmd), transcription=text)
             return True
         try:
             out = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=float(r.get("cmd_timeout_seconds", 30)),
+                timeout=float(self.cfg.get("cmd_timeout_seconds", default=180)),
             )
             ok = out.returncode == 0
-            log("sessions send", ok=ok, rc=out.returncode,
-                err=out.stderr[:200] if not ok else "", **entry)
+            log("agent turn routed", ok=ok, rc=out.returncode,
+                transcription=text, message=msg,
+                err=out.stderr[:200] if not ok else "")
             return ok
         except Exception as exc:
-            log("sessions send failed", error=str(exc)[:200], **entry)
+            log("agent turn route failed", error=str(exc)[:200],
+                transcription=text)
             return False
 
     # -- main loop ------------------------------------------------------------
 
     async def run(self) -> None:
-        log("voice loop started (scaffold)", gateway=GATEWAY_URL,
-            send_enabled=bool(self.cfg.get("route", "send_enabled", default=False)))
+        log("wake-word voice loop started", gateway=GATEWAY_URL,
+            wake_words=self.cfg.get("wake_words", default=[]),
+            send_enabled=bool(self.cfg.get("send_enabled", default=True)))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop.set)
 
+        last_gate_reason = ""
         while not self.stop.is_set():
             self.cfg.reload()
-            poll = max(0.25, float(self.cfg.get("poll_interval_seconds", default=0.5)))
-            gate = max(1.0, float(self.cfg.get("idle_gate_seconds", default=3.0)))
+            gate_sleep = max(1.0, float(self.cfg.get("idle_poll_seconds", default=3.0)))
             now = time.monotonic()
 
-            if not self.cfg.get("enabled", default=True) or now < self.cooldown_until:
-                await self._sleep(gate)
-                continue
-            # Gate: only ever touch-poll while the agent-status watcher says
-            # idle — never compete with an active ack window (done-ack /
-            # waiting states) and never add load while agents are running.
-            if agent_state() != "idle":
-                self.held_since = None
-                await self._sleep(gate)
+            if now < self.backoff_until or now < self.cooldown_until:
+                await self._sleep(min(gate_sleep,
+                                      max(self.backoff_until, self.cooldown_until) - now + 0.1))
                 continue
 
-            st = await self.touch()
-            if st and st.get("available"):
-                reason = self.long_press(st)
-                if reason:
-                    # Re-check the gate right before capturing.
-                    if agent_state() == "idle":
-                        await self.capture(reason)
-                        continue
-                    self.held_since = None
-            await self._sleep(poll)
+            ok, reason = gate_open(self.cfg)
+            if not ok:
+                if reason != last_gate_reason:
+                    log("gate closed; mic idle", reason=reason)
+                    last_gate_reason = reason
+                await self._sleep(gate_sleep)
+                continue
+            if last_gate_reason:
+                log("gate open; wake polling resumes")
+                last_gate_reason = ""
+
+            heard = await self.listen(
+                float(self.cfg.get("wake_listen_seconds", default=3.0)),
+                why="wake-poll")
+            if heard:
+                matched, remainder = wake_match(self.cfg, heard)
+                if matched:
+                    # Re-check gate right before the interactive capture.
+                    if gate_open(self.cfg)[0]:
+                        await self.handle_wake(remainder, heard)
+                    continue
+                log("heard (no wake word)", text=heard[:120])
+            await self._sleep(max(0.25, float(
+                self.cfg.get("wake_poll_gap_seconds", default=1.0))))
 
         log("voice loop shutting down")
+        self._flag_down()
 
     async def _sleep(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):
@@ -361,19 +562,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="daemon loop")
-    sub.add_parser("once", help="single gate+touch snapshot, no capture")
+    sub.add_parser("once", help="gate snapshot + one wake window, no send")
     args = ap.parse_args()
 
     cfg = Config()
     if args.cmd == "once":
         async def _once() -> None:
             vl = VoiceLoop(cfg)
-            st = await vl.touch()
+            ok, reason = gate_open(cfg)
+            heard = await vl.listen(
+                float(cfg.get("wake_listen_seconds", default=3.0)),
+                why="once") if ok else None
+            matched, remainder = wake_match(cfg, heard or "")
             print(json.dumps({
+                "gate_open": ok, "gate_reason": reason,
                 "agent_state": agent_state(),
-                "gate_open": agent_state() == "idle",
-                "touch": st,
-                "send_enabled": bool(cfg.get("route", "send_enabled", default=False)),
+                "heard": heard, "wake_matched": matched,
+                "remainder": remainder,
+                "send_enabled": bool(cfg.get("send_enabled", default=True)),
             }, indent=2))
         asyncio.run(_once())
         return

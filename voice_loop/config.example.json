@@ -1,49 +1,38 @@
 {
-  "_comment": "StackChan tap-to-talk voice loop. Hot-reloaded on mtime change. send_enabled=false keeps sessions-send in dry-run (logged, not sent).",
+  "_comment": "StackChan wake-word voice loop. Hot-reloaded on mtime change. send_enabled=false => dry-run (exact command logged, not sent).",
   "enabled": true,
-  "poll_interval_seconds": 0.5,
-  "idle_gate_seconds": 3.0,
-  "long_press_seconds": 1.5,
-  "stroke_trigger": true,
-  "stroke_fresh_ms": 1500,
-  "listen_duration_ms": 6000,
-  "listen_engine": "faster-whisper",
-  "cooldown_seconds": 15,
-  "chime": {
-    "enabled": true,
-    "text": "Yes?"
+  "wake_words": ["hey cherub", "okay cherub", "ok cherub", "hey cherubesque", "cherub"],
+  "fuzzy_ratio": 0.82,
+  "wake_listen_seconds": 3.0,
+  "wake_poll_gap_seconds": 1.0,
+  "prompt_listen_seconds": 7.0,
+  "min_prompt_chars": 2,
+  "min_prompt_words": 1,
+  "ignore": [
+    "thank you", "thanks for watching", "thanks", "you", ".", "bye",
+    "whoop", "hmm", "uh", "oh", "ok", "okay", "yeah", "bye-bye",
+    "thank you for watching", "please subscribe", "silence", "music"
+  ],
+  "idle_poll_seconds": 3.0,
+  "cooldown_seconds": 10.0,
+  "stt_model": "base.en",
+  "language": "en",
+  "send_enabled": true,
+  "target_session": "agent:main:telegram:direct:YOUR_CHAT_ID",
+  "prefix": "[voice] ",
+  "speak_marker": " [[speak]]",
+  "openclaw_bin": "openclaw",
+  "deliver_reply": true,
+  "cmd_timeout_seconds": 180,
+  "listening_cue": {
+    "greeting": "Yes?",
+    "greeting_enabled": true,
+    "led": {"r": 0, "g": 120, "b": 120},
+    "face": "thinking"
   },
-  "cues": {
-    "listening_led": {
-      "r": 0,
-      "g": 120,
-      "b": 120
-    },
-    "listening_face": "thinking",
-    "ok_led": {
-      "r": 0,
-      "g": 120,
-      "b": 20
-    },
-    "fail_led": {
-      "r": 120,
-      "g": 40,
-      "b": 0
-    },
-    "idle_led": {
-      "r": 0,
-      "g": 2,
-      "b": 4
-    },
-    "idle_face": "idle"
-  },
-  "route": {
-    "send_enabled": false,
-    "session_key": "agent:main:telegram:direct:YOUR_TELEGRAM_ID",
-    "prefix": "[voice] ",
-    "speak_marker": " [[speak]]",
-    "openclaw_bin": "openclaw",
-    "cmd_timeout_seconds": 30
-  },
-  "min_transcript_chars": 2
+  "ok_led": {"r": 0, "g": 120, "b": 20},
+  "fail_led": {"r": 100, "g": 30, "b": 0},
+  "idle_led": {"r": 0, "g": 2, "b": 4},
+  "idle_face": "idle",
+  "gateway_backoff_seconds": 60
 }

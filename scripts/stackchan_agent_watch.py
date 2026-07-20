@@ -545,6 +545,15 @@ class Watcher:
             self.ack["next_poll"] = now + max(
                 2.0, float(a.get("poll_interval_seconds", 2))
             )
+            # Mic-ownership guard (2026-07-19): the wake-word voice loop
+            # writes voice_loop/capturing.flag while it holds a listen
+            # window. Skip this tick's voice-ack listen if that flag is
+            # fresh so the two daemons never capture concurrently.
+            vflag = STATUS_DIR.parent / "voice_loop" / "capturing.flag"
+            with contextlib.suppress(OSError):
+                if vflag.exists() and time.time() - vflag.stat().st_mtime < 120:
+                    log("voice-ack tick skipped; voice loop holds the mic")
+                    return
             secs = float(v.get("listen_seconds", 4))
             heard = await self.body.listen(secs)
             keywords = [str(k).lower() for k in v.get(
